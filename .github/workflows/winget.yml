@@ -1,0 +1,70 @@
+# Submits each new KeyScope release to winget (microsoft/winget-pkgs) as a pull request.
+#
+# Runs when a release is published (tools/Publish-Release.ps1 in the source project does that), or
+# by hand from the Actions tab with a tag. It only UPDATES the package: the first version must
+# already be in winget, submitted by hand (tools/New-WingetManifest.ps1).
+#
+# Needs the repository secret WINGET_TOKEN: a classic personal access token with the public_repo
+# scope, from the account that will open the pull requests. wingetcreate forks winget-pkgs into
+# that account and opens the pull request from the fork.
+#
+# PACKAGE_ID and ARCHITECTURES below must match tools/ReleaseSettings.psd1 and the
+# installers of the version already in winget: wingetcreate fails if the number of links differs
+# from the number of installer entries.
+
+name: Submit to winget
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to submit, for example v1.0.1'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  winget:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: windows-latest
+    steps:
+      # wingetcreate's standalone exe needs a .NET runtime that the runner image may not include.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            6.0.x
+            8.0.x
+
+      - name: Submit the new version
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REPO: ${{ github.repository }}
+          PACKAGE_ID: UnpossibleApps.KeyScope
+          ARCHITECTURES: x64 arm64
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:WINGET_TOKEN) { throw 'The WINGET_TOKEN secret is not set.' }
+          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+)$') { throw "Tag '$env:TAG' is not of the form vX.Y.Z." }
+          $version = $Matches[1]
+          $base = "https://github.com/$env:REPO/releases/download/$env:TAG"
+
+          # One link per installer entry: each architecture is listed once per scope. The Inno
+          # Setup exe is itself 32-bit, so the architecture has to be stated explicitly.
+          $urls = foreach ($arch in $env:ARCHITECTURES.Split(' ')) {
+            foreach ($scope in 'user', 'machine') { "$base/KeyScope-$version-setup-$arch.exe|$arch|$scope" }
+          }
+
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update $env:PACKAGE_ID `
+            --version $version `
+            --urls $urls `
+            --release-notes-url "https://github.com/$env:REPO/releases/tag/$env:TAG" `
+            --release-date (Get-Date -Format 'yyyy-MM-dd') `
+            --token $env:WINGET_TOKEN `
+            --submit
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate failed (exit code $LASTEXITCODE)." }
